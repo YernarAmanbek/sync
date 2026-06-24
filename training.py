@@ -53,11 +53,14 @@ def make_optimizer(model: nn.Module, cfg: OptimConfig) -> torch.optim.Optimizer:
 
 
 def lr_lambda(step: int, cfg: OptimConfig) -> float:
-    """Linear warmup then cosine decay to 0 over max_steps. Concrete."""
+    """Linear warmup then cosine decay over max_steps. Decays to `min_lr_ratio`
+    (not 0) so the sustained LR can be held above zero in the useful regime."""
     if step < cfg.warmup_steps:
         return step / max(1, cfg.warmup_steps)
     prog = (step - cfg.warmup_steps) / max(1, cfg.max_steps - cfg.warmup_steps)
-    return 0.5 * (1.0 + math.cos(math.pi * min(1.0, prog)))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * min(1.0, prog)))
+    floor = getattr(cfg, "min_lr_ratio", 0.0)
+    return floor + (1.0 - floor) * cosine
 
 
 def beta_schedule(step: int, beta_max: float, warmup_steps: int) -> float:

@@ -60,6 +60,9 @@ def main() -> None:
 
     # --- train_predictor ---
     ap.add_argument("--max-steps", type=int, default=None)
+    ap.add_argument("--lr", type=float, default=None, help="predictor peak LR override")
+    ap.add_argument("--min-lr-ratio", type=float, default=None,
+                    help="predictor cosine floor: LR decays to min_lr_ratio*lr instead of 0")
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--num-workers", type=int, default=None)
     ap.add_argument("--out-dir", default="./runs")
@@ -116,6 +119,10 @@ def main() -> None:
         a = ["--task", args.task, "--out-dir", args.out_dir, *smoke]
         if args.max_steps is not None:
             a += ["--max-steps", str(args.max_steps)]
+        if args.lr is not None:
+            a += ["--lr", str(args.lr)]
+        if args.min_lr_ratio is not None:
+            a += ["--min-lr-ratio", str(args.min_lr_ratio)]
         if args.batch_size is not None:
             a += ["--batch-size", str(args.batch_size)]
         if args.num_workers is not None:

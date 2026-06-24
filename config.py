@@ -112,6 +112,7 @@ class OptimConfig:
     betas: tuple[float, float] = (0.9, 0.98)
     warmup_steps: int = 4_000
     max_steps: int = 500_000
+    min_lr_ratio: float = 0.0       # cosine decays to (min_lr_ratio * lr), not 0 — sustains LR
     grad_clip: float = 1.0
     batch_size: int = 256
     amp_dtype: str = "bfloat16"     # {"bfloat16", "float16", "float32"}

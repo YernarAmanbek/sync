@@ -20,6 +20,9 @@ def main() -> None:
     ap.add_argument("--task", default="gigaword")
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--max-steps", type=int, default=None)
+    ap.add_argument("--lr", type=float, default=None, help="peak LR override")
+    ap.add_argument("--min-lr-ratio", type=float, default=None,
+                    help="cosine floor: LR decays to min_lr_ratio*lr instead of 0")
     ap.add_argument("--num-workers", type=int, default=None)
     ap.add_argument("--out-dir", default=None)
     ap.add_argument("--smoke", action="store_true")
@@ -31,6 +34,10 @@ def main() -> None:
         cfg.train.phase2.batch_size = args.batch_size
     if args.max_steps is not None:
         cfg.train.phase2.max_steps = args.max_steps
+    if args.lr is not None:
+        cfg.train.phase2.lr = args.lr
+    if args.min_lr_ratio is not None:
+        cfg.train.phase2.min_lr_ratio = args.min_lr_ratio
     if args.num_workers is not None:
         cfg.data.num_workers = args.num_workers
     if args.out_dir is not None:
