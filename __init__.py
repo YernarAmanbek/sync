@@ -17,7 +17,8 @@ from .data import (
     Tokenizer,
     CodecChunkDataset,
     PairLatentDataset,
-    compute_latent_scale,
+    Whitening,
+    compute_latent_whitening,
 )
 from .training import train_codec, train_predictor, finetune_joint, freeze_and_scale
 from .generate import TextGenerator
@@ -37,7 +38,8 @@ __all__ = [
     "Tokenizer",
     "CodecChunkDataset",
     "PairLatentDataset",
-    "compute_latent_scale",
+    "Whitening",
+    "compute_latent_whitening",
     "train_codec",
     "train_predictor",
     "finetune_joint",

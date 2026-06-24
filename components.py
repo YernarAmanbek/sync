@@ -12,6 +12,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class RMSNorm(nn.Module):
@@ -46,8 +47,27 @@ class TransformerBlock(nn.Module):
     ):
         super().__init__()
         self.cross_attn = cross_attn
-        # AGENT: build norms, attention projections, (optional) cross-attn, MLP.
-        raise NotImplementedError("AGENT: build TransformerBlock submodules")
+        hidden = ffn_mult * d_model
+
+        self.norm1 = RMSNorm(d_model)
+        self.self_attn = nn.MultiheadAttention(
+            d_model, n_heads, dropout=dropout, batch_first=True
+        )
+        if cross_attn:
+            self.cross_norm = RMSNorm(d_model)
+            self.cross_attn_mod = nn.MultiheadAttention(
+                d_model, n_heads, dropout=dropout, batch_first=True
+            )
+        self.norm2 = RMSNorm(d_model)
+        # gated MLP (SwiGLU): project to 2*hidden, gate one half with SiLU
+        self.w_in = nn.Linear(d_model, 2 * hidden)
+        self.w_out = nn.Linear(hidden, d_model)
+        self.drop = nn.Dropout(dropout)
+
+    @staticmethod
+    def _key_padding(mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        # our masks are True=keep; nn.MultiheadAttention wants True=ignore
+        return None if mask is None else ~mask
 
     def forward(
         self,
@@ -56,7 +76,25 @@ class TransformerBlock(nn.Module):
         context: Optional[torch.Tensor] = None,      # [B, S, d_model] (if cross_attn)
         context_mask: Optional[torch.Tensor] = None, # [B, S] bool
     ) -> torch.Tensor:                           # [B, T, d_model]
-        raise NotImplementedError("AGENT: forward of TransformerBlock")
+        h = self.norm1(x)
+        a, _ = self.self_attn(
+            h, h, h, key_padding_mask=self._key_padding(self_mask), need_weights=False
+        )
+        x = x + self.drop(a)
+
+        if self.cross_attn and context is not None:
+            h = self.cross_norm(x)
+            a, _ = self.cross_attn_mod(
+                h, context, context,
+                key_padding_mask=self._key_padding(context_mask),
+                need_weights=False,
+            )
+            x = x + self.drop(a)
+
+        h = self.norm2(x)
+        gate, up = self.w_in(h).chunk(2, dim=-1)
+        x = x + self.drop(self.w_out(F.silu(gate) * up))
+        return x
 
 
 class TransformerStack(nn.Module):
@@ -130,8 +168,11 @@ class TimestepEmbedding(nn.Module):
     def __init__(self, embed_dim: int, out_dim: int):
         super().__init__()
         self.embed_dim = embed_dim
-        # AGENT: small MLP embed_dim -> out_dim (e.g. Linear-SiLU-Linear).
-        raise NotImplementedError("AGENT: build TimestepEmbedding MLP")
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, out_dim),
+            nn.SiLU(),
+            nn.Linear(out_dim, out_dim),
+        )
 
     def _sinusoidal(self, t: torch.Tensor) -> torch.Tensor:  # [B] -> [B, embed_dim]
         half = self.embed_dim // 2
@@ -142,7 +183,7 @@ class TimestepEmbedding(nn.Module):
         return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:  # [B] -> [B, out_dim]
-        raise NotImplementedError("AGENT: run _sinusoidal(t) through the MLP")
+        return self.mlp(self._sinusoidal(t))
 
 
 class LearnedPositionalEmbedding(nn.Module):
@@ -174,20 +215,25 @@ class ChunkAwarePositionalEmbedding(nn.Module):
         self.within_pos = nn.Embedding(latents_per_chunk, d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # [B, n_chunks*q, d_model] -> same
-        raise NotImplementedError("AGENT: add chunk + within-chunk positions")
+        T = x.shape[1]
+        assert T % self.q == 0, f"seq len {T} not a multiple of q={self.q}"
+        idx = torch.arange(T, device=x.device)
+        chunk_ids = idx // self.q          # [T] in 0..n_chunks-1
+        within_ids = idx % self.q          # [T] in 0..q-1
+        pos = self.chunk_pos(chunk_ids) + self.within_pos(within_ids)  # [T, d_model]
+        return x + pos[None, :, :]
 
 
 # --------------------------------------------------------------------------- #
 # Masking utilities
 # --------------------------------------------------------------------------- #
 def lengths_to_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
-    """`lengths [B]` -> boolean `[B, max_len]`, True for valid positions.
-    AGENT TASK: implement (arange < lengths[:, None])."""
-    raise NotImplementedError("AGENT: lengths_to_mask")
+    """`lengths [B]` -> boolean `[B, max_len]`, True for valid positions."""
+    ar = torch.arange(max_len, device=lengths.device)
+    return ar[None, :] < lengths[:, None]
 
 
 def expand_chunk_mask(chunk_mask: torch.Tensor, q: int) -> torch.Tensor:
     """Expand a per-chunk mask `[B, n_chunks]` to per-latent-token
-    `[B, n_chunks*q]` for the flattened predictor sequence.
-    AGENT TASK: repeat_interleave along the chunk dim by q."""
-    raise NotImplementedError("AGENT: expand_chunk_mask")
+    `[B, n_chunks*q]` for the flattened predictor sequence."""
+    return chunk_mask.repeat_interleave(q, dim=1)

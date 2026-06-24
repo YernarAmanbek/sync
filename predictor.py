@@ -80,8 +80,7 @@ class FlowMatchingPredictor(nn.Module):
         self.backbone = TransformerStack(
             cfg.d_model, cfg.n_heads, cfg.n_layers, cfg.ffn_mult, cfg.dropout, cross_attn=True
         )
-        # AGENT: self.out_proj : Linear(d_model, latent_dim)
-        raise NotImplementedError("AGENT: build out_proj")
+        self.out_proj = nn.Linear(cfg.d_model, cfg.latent_dim)
 
     def forward(
         self,
@@ -91,7 +90,24 @@ class FlowMatchingPredictor(nn.Module):
         context_mask: Optional[torch.Tensor] = None,  # [B, N_ctx*q] bool
         target_mask: Optional[torch.Tensor] = None,   # [B, M*q] bool
     ) -> torch.Tensor:                           # v_hat [B, M*q, d]
-        raise NotImplementedError("AGENT: forward of FlowMatchingPredictor")
+        B = z_t.shape[0]
+
+        # target stream: project, add chunk-aware positions, inject time
+        h = self.in_proj(z_t)                    # [B, M*q, d_model]
+        h = self.tgt_pos(h)
+        h = h + self.time_embed(t)[:, None, :]   # broadcast time over tokens
+
+        # context stream: either projected real context or the learned null token
+        if context is None:
+            ctx = self.null_context.expand(B, 1, -1)         # [B, 1, d_model]
+            ctx_mask = None
+        else:
+            ctx = self.ctx_proj(context)                     # [B, N_ctx*q, d_model]
+            ctx = self.ctx_pos(ctx)
+            ctx_mask = context_mask
+
+        h = self.backbone(h, self_mask=target_mask, context=ctx, context_mask=ctx_mask)
+        return self.out_proj(h)                  # [B, M*q, d]
 
 
 class CountHead(nn.Module):
@@ -104,13 +120,23 @@ class CountHead(nn.Module):
     def __init__(self, cfg: PredictorConfig):
         super().__init__()
         self.n_tgt_chunks = cfg.n_tgt_chunks
-        # AGENT: MLP latent_dim -> (M+1)
-        raise NotImplementedError("AGENT: build CountHead")
+        hidden = cfg.d_model
+        self.mlp = nn.Sequential(
+            nn.Linear(cfg.latent_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, cfg.n_tgt_chunks + 1),  # classes 0..M
+        )
 
     def forward(
         self, context: torch.Tensor, context_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:  # [B, N_ctx*q, d] -> [B, M+1]
-        raise NotImplementedError("AGENT: forward of CountHead")
+        if context_mask is None:
+            pooled = context.mean(dim=1)
+        else:
+            w = context_mask.float()[:, :, None]             # [B, T, 1]
+            denom = w.sum(dim=1).clamp(min=1.0)
+            pooled = (context * w).sum(dim=1) / denom         # [B, d]
+        return self.mlp(pooled)
 
 
 # --------------------------------------------------------------------------- #
@@ -138,14 +164,65 @@ class FlowSampler:
     @torch.no_grad()
     def sample(
         self,
-        context: torch.Tensor,                   # [B, N_ctx*q, d] (scaled)
+        context: torch.Tensor,                   # [B, N_ctx*q, d] (whitened)
         context_mask: Optional[torch.Tensor] = None,
         steps: Optional[int] = None,
         guidance_scale: Optional[float] = None,
         generator: Optional[torch.Generator] = None,
+        m_override: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns (Z_hat [B, M*q, d] scaled, m [B] predicted chunk counts)."""
-        raise NotImplementedError("AGENT: FlowSampler.sample (ODE + CFG)")
+        """Integrate dZ/dt = v_hat from noise (t=0) to data (t=1). CFG mixes the
+        conditional and unconditional velocity fields. Returns
+        (Z_hat [B, M*q, d] whitened, m [B] predicted chunk counts)."""
+        cfg = self.cfg
+        q = cfg.latents_per_chunk
+        M = cfg.n_tgt_chunks
+        d = cfg.latent_dim
+        steps = steps or cfg.sample_steps
+        guidance = cfg.guidance_scale if guidance_scale is None else guidance_scale
+        B = context.shape[0]
+        device = context.device
+
+        # 1. chunk count -> per-target-token mask
+        if m_override is not None:
+            m = m_override.to(device).long()
+        else:
+            m = self.count_head(context, context_mask).argmax(dim=-1)  # [B]
+        m = m.clamp(min=1, max=M)
+        chunk_mask = torch.arange(M, device=device)[None, :] < m[:, None]  # [B, M]
+        target_mask = expand_chunk_mask(chunk_mask, q)                     # [B, M*q]
+
+        # 2. noise at t=0
+        Z = torch.randn(B, M * q, d, device=device, generator=generator)
+
+        def velocity(z: torch.Tensor, t_scalar: float) -> torch.Tensor:
+            t = torch.full((B,), t_scalar, device=device)
+            v_cond = self.predictor(z, t, context, context_mask, target_mask)
+            if guidance == 1.0:
+                return v_cond
+            v_uncond = self.predictor(z, t, None, None, target_mask)
+            return v_uncond + guidance * (v_cond - v_uncond)
+
+        # 3. integrate
+        dt = 1.0 / steps
+        solver = cfg.ode_solver
+        for k in range(steps):
+            t0 = k * dt
+            if solver == "euler":
+                Z = Z + dt * velocity(Z, t0)
+            elif solver == "midpoint":
+                v1 = velocity(Z, t0)
+                Z = Z + dt * velocity(Z + 0.5 * dt * v1, t0 + 0.5 * dt)
+            elif solver == "rk4":
+                k1 = velocity(Z, t0)
+                k2 = velocity(Z + 0.5 * dt * k1, t0 + 0.5 * dt)
+                k3 = velocity(Z + 0.5 * dt * k2, t0 + 0.5 * dt)
+                k4 = velocity(Z + dt * k3, t0 + dt)
+                Z = Z + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+            else:
+                raise ValueError(f"unknown ode_solver {solver!r}")
+
+        return Z, m
 
 
 # --------------------------------------------------------------------------- #
@@ -159,6 +236,21 @@ def ood_score(
     """Score how far a prompt's latents sit from the training distribution, so a
     bounded-input deployment can refuse/fallback. Two viable implementations:
       (a) negative log-likelihood under the VAE prior N(0,I) (cheap, weak), or
-      (b) Mahalanobis distance / kNN distance to cached training latents (better).
-    AGENT TASK: implement (b) by default; (a) as a fallback when train_stats is None."""
-    raise NotImplementedError("AGENT: ood_score")
+      (b) Mahalanobis distance to cached training-latent stats (better)."""
+    # pool valid context latents -> [B, d]
+    x = context_latents.mean(dim=2)              # average over q -> [B, N_ctx, d]
+    if context_mask is None:
+        pooled = x.mean(dim=1)
+    else:
+        w = context_mask.float()[:, :, None]
+        pooled = (x * w).sum(dim=1) / w.sum(dim=1).clamp(min=1.0)
+
+    if train_stats is not None and "mean" in train_stats and "cov_inv" in train_stats:
+        mean = torch.as_tensor(train_stats["mean"], device=pooled.device, dtype=pooled.dtype)
+        cov_inv = torch.as_tensor(train_stats["cov_inv"], device=pooled.device, dtype=pooled.dtype)
+        delta = pooled - mean                    # [B, d]
+        # Mahalanobis distance: sqrt((x-mu)^T S^-1 (x-mu))
+        maha = torch.einsum("bi,ij,bj->b", delta, cov_inv, delta).clamp(min=0.0)
+        return torch.sqrt(maha)
+    # fallback (a): NLL under N(0, I) up to a constant == 0.5 * ||x||^2
+    return 0.5 * pooled.pow(2).sum(dim=-1)

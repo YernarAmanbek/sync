@@ -1,0 +1,33 @@
+# latent_text_gen — dependencies (Linux GPU server)
+#
+# INSTALL ORDER MATTERS. Do NOT independently pin torch/fairseq2/CUDA here:
+# that is exactly how the fairseq2 <-> torch <-> CUDA conflicts bite. Instead:
+#
+#   1. Create a fresh env (python 3.10/3.11):
+#        conda create -n ltg python=3.11 -y && conda activate ltg
+#   2. Install SONAR FIRST and let it resolve torch/fairseq2 for your CUDA:
+#        pip install sonar-space
+#   3. Install the remaining (codec-agnostic) deps:
+#        pip install -r requirements.txt
+#   4. Freeze the *resolved* set for reproducibility on this box:
+#        pip freeze > requirements.lock.txt
+#
+# The packages below deliberately avoid torch/fairseq2/sonar-space version pins.
+
+# --- data + chunking ---
+datasets>=2.18
+syntok>=1.4
+sentencepiece>=0.1.99
+
+# --- evaluation (independent of SONAR, to avoid circular scoring) ---
+sentence-transformers>=2.6
+
+# --- utils ---
+numpy>=1.24
+tqdm>=4.66
+
+# Installed in step 2 (listed here only as documentation, intentionally unpinned):
+#   sonar-space
+#   torch         (resolved by sonar-space for your CUDA)
+#   fairseq2      (resolved by sonar-space)
+#   transformers  (pulled in by sentence-transformers / sonar)

@@ -153,10 +153,115 @@ class Config:
     train: TrainConfig = field(default_factory=TrainConfig)
     infer: InferenceConfig = field(default_factory=InferenceConfig)
 
-    # computed after Phase 1 and the codec is frozen (README §7). Shape [d] or scalar.
+    # computed after Phase 1 and the codec is frozen (README §7).
+    # On the SONAR path we whiten instead of per-dim scaling; the whitening
+    # stats (mean + ZCA/PCA matrices) live on disk in `data.latent_cache_dir`
+    # (see data.Whitening). This field is kept for the custom-codec path / compat.
     latent_scale: Optional[list[float]] = None
 
     def validate(self) -> None:
-        """AGENT TASK: assert cross-config consistency (latent_dim, q, L match
-        across codec/predictor/chunk; M ≤ n_tgt_chunks; mask_id is set; etc.)."""
-        raise NotImplementedError("AGENT: implement cross-field consistency checks")
+        """Assert cross-field consistency. Cheap, fail-fast — these mismatches are
+        exactly the "fails silently" class from README §7."""
+        c, p, ch = self.codec, self.predictor, self.chunk
+
+        # latent geometry must agree across codec and predictor
+        assert c.latent_dim == p.latent_dim, (
+            f"latent_dim mismatch: codec={c.latent_dim} predictor={p.latent_dim}"
+        )
+        assert c.latents_per_chunk == p.latents_per_chunk, (
+            f"q mismatch: codec={c.latents_per_chunk} predictor={p.latents_per_chunk}"
+        )
+
+        # token length L must agree across chunker and codec
+        assert ch.max_tokens == c.max_tokens, (
+            f"L mismatch: chunk={ch.max_tokens} codec={c.max_tokens}"
+        )
+
+        # response canvas: inference cap must fit inside the trained canvas M
+        assert self.infer.max_response_chunks <= p.n_tgt_chunks, (
+            f"infer.max_response_chunks={self.infer.max_response_chunks} "
+            f"> M(n_tgt_chunks)={p.n_tgt_chunks}"
+        )
+
+        if c.use_pretrained_codec:
+            # SONAR is a single 1024-d sentence embedding per chunk.
+            assert c.latents_per_chunk == 1, "SONAR codec requires q == 1"
+            assert c.latent_dim == 1024, "SONAR codec requires latent_dim == 1024"
+        else:
+            # custom CMLM codec needs a real [MASK] id
+            assert self.tokenizer.mask_id >= 0, (
+                "mask_id not set; load the tokenizer (adds [MASK]) before validate()"
+            )
+
+
+# --------------------------------------------------------------------------- #
+# Rung presets (SONAR validation path). See README §8 / the plan.
+# --------------------------------------------------------------------------- #
+def _sonar_base() -> "Config":
+    """Common SONAR settings: frozen pretrained codec, single 1024-d latent."""
+    cfg = Config()
+    cfg.codec.use_pretrained_codec = True
+    cfg.codec.latents_per_chunk = 1
+    cfg.codec.latent_dim = 1024
+    cfg.predictor.latents_per_chunk = 1
+    cfg.predictor.latent_dim = 1024
+    return cfg
+
+
+def rung0_gigaword() -> "Config":
+    """Rung 0, map axis: first sentence -> headline (n≈1, m=1, meaning-changing)."""
+    cfg = _sonar_base()
+    cfg.predictor.n_ctx_chunks = 4      # N_ctx: prompt is ~1 sentence, allow a little slack
+    cfg.predictor.n_tgt_chunks = 2      # M: response is 1 sentence
+    cfg.infer.max_response_chunks = 2
+    cfg.data.pair_paths = ["gigaword"]
+    cfg.data.latent_cache_dir = "./cache/gigaword"
+    return cfg
+
+
+def rung0_mscoco() -> "Config":
+    """Rung 0, diversity axis: multi-reference captions (n≈1, m=1, one-to-many)."""
+    cfg = _sonar_base()
+    cfg.predictor.n_ctx_chunks = 2
+    cfg.predictor.n_tgt_chunks = 2
+    cfg.infer.max_response_chunks = 2
+    cfg.data.pair_paths = ["mscoco"]
+    cfg.data.latent_cache_dir = "./cache/mscoco"
+    return cfg
+
+
+def rung1_xsum() -> "Config":
+    """Rung 1: long article -> one-sentence summary (n=many, m=1).
+    N_ctx generous — XSum articles run 20-40+ sentences; clipping caps quality."""
+    cfg = _sonar_base()
+    cfg.predictor.n_ctx_chunks = 48
+    cfg.predictor.n_tgt_chunks = 2
+    cfg.infer.max_response_chunks = 2
+    cfg.data.pair_paths = ["xsum"]
+    cfg.data.latent_cache_dir = "./cache/xsum"
+    return cfg
+
+
+def rung2_multi() -> "Config":
+    """Rung 2: multi-sentence output (m>1) — the first real multi-chunk test."""
+    cfg = _sonar_base()
+    cfg.predictor.n_ctx_chunks = 48
+    cfg.predictor.n_tgt_chunks = 8
+    cfg.infer.max_response_chunks = 8
+    cfg.data.pair_paths = ["cnn_dailymail"]
+    cfg.data.latent_cache_dir = "./cache/cnndm"
+    return cfg
+
+
+PRESETS = {
+    "gigaword": rung0_gigaword,
+    "mscoco": rung0_mscoco,
+    "xsum": rung1_xsum,
+    "cnn_dailymail": rung2_multi,
+}
+
+
+def get_preset(name: str) -> "Config":
+    if name not in PRESETS:
+        raise KeyError(f"unknown preset {name!r}; choose from {sorted(PRESETS)}")
+    return PRESETS[name]()

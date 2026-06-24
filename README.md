@@ -153,4 +153,65 @@ are unchanged either way.
 - **Loss is masked to real slots.** Flow MSE is computed over the first `m`
   response chunks only; the count head decides `m` at inference and the rest of
   the canvas is discarded.
+
+---
+
+## 8. MVP build (SONAR validation path) & running on the GPU server
+
+The first thing built is **not** the custom codec but the frozen-SONAR "buy" path,
+used to validate the one unproven claim (a generative latent predictor produces
+coherent *and* diverse responses). See the plan for full rationale; the essentials:
+
+**Rung ladder (build rung 0 first).** Difficulty splits on two axes — input
+selection (`n`) vs. output composition (`m`, the multi-chunk thesis):
+- **Rung 0 — a *pair* of single-sentence tasks (`n≈1, m=1`)** that separate the
+  predictor's two jobs:
+  - **Gigaword** (first sentence → headline): a *meaning-changing* map. Tests
+    "can the flow learn a non-trivial conditional map." Run this first.
+  - **MSCOCO** (multi-reference captions): genuinely *one-to-many*. Tests "does
+    sampling buy *valid* diversity" via multi-reference **coverage**.
+- **Rung 1 — XSum (`n=many, m=1`)**: adds cross-document selection.
+- **Rung 2 — `m>1`** (CNN/DM, multi-sentence MT): first real test of multi-chunk.
+- Custom NAT codec is **iteration 3**, gated on rung-2 — not on any `m=1` task.
+
+**Why not WMT/paraphrase at rung 0.** SONAR's space is meaning-based, so
+`decode(embed(src), tgt_lang="eng")` zero-shot translates → WMT is degenerate
+(`f≈identity`, benchmarks SONAR not the predictor). Paraphrase is weak on the map
+axis and (ParaNMT) single-reference.
+
+**Metrics — NOT ROUGE/BLEU** (they penalize the lexical variation we want):
+- **Quality** = semantic similarity to reference(s) via an *independent* sentence
+  embedder (sentence-transformers), never SONAR itself (circular).
+- **Diversity** = multi-reference **coverage/recall** (primary) + sample
+  distinctness (secondary).
+- Always reported as **curves vs `guidance_scale`** (CFG trades quality↔diversity).
+
+**Gates (run before spending GPU on the predictor):**
+- **Gate 0 — reconstruction ceiling.** SONAR `q=1` means a perfect predictor can
+  do no better than SONAR's own encode→decode round-trip on the targets. Measure
+  it (semantic similarity) to know the headroom.
+- **Gate 1 — whitened-marginal sanity.** SONAR is not a KL-regularized VAE space;
+  use **full ZCA/PCA whitening** (not per-dim scaling), then fit a tiny
+  *unconditional* flow on the whitened marginal and check it decodes coherently.
+
+### Environment (Linux GPU server)
+```bash
+conda create -n ltg python=3.11 -y && conda activate ltg
+pip install sonar-space                 # FIRST: resolves torch/fairseq2 for your CUDA
+pip install -r requirements.txt         # data/eval/util deps (no torch pins)
+pip freeze > requirements.lock.txt      # reproducible resolved set
+```
+
+### Running (from the parent directory of this package)
+```bash
+python -m Sync.scripts.gate_ceiling       --task gigaword --smoke   # Gate 0
+python -m Sync.scripts.precompute_latents  --task gigaword           # cache + whitening
+python -m Sync.scripts.gate_uncond_flow   --task gigaword           # Gate 1
+python -m Sync.scripts.train_predictor    --task gigaword           # Phase 2
+python -m Sync.scripts.eval_curves        --task gigaword --ckpt runs/predictor_final.pt
+# diversity read on the one-to-many task:
+python -m Sync.scripts.eval_curves        --task mscoco   --ckpt runs/predictor_final.pt
+```
+All scripts accept `--smoke` for a tiny end-to-end subset. Suggested order if
+budget-limited: Gigaword (map) → MSCOCO (diversity).
  

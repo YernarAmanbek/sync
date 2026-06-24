@@ -18,9 +18,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+import os
+
 from .codec import CodecInterface, LatentCodec
 from .config import Config, OptimConfig
-from .data import compute_latent_scale
+from .data import Whitening, compute_latent_whitening
+from .components import expand_chunk_mask
 from .predictor import (
     CountHead,
     FlowMatchingPredictor,
@@ -33,9 +36,20 @@ from .predictor import (
 # Shared utilities
 # --------------------------------------------------------------------------- #
 def make_optimizer(model: nn.Module, cfg: OptimConfig) -> torch.optim.Optimizer:
-    """AdamW with no weight decay on norms/biases/embeddings.
-    AGENT TASK: build param groups, return AdamW(betas=cfg.betas, ...)."""
-    raise NotImplementedError("AGENT: make_optimizer")
+    """AdamW with no weight decay on norms/biases/embeddings."""
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim <= 1 or name.endswith(".bias") or "embed" in name.lower() or "norm" in name.lower():
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    groups = [
+        {"params": decay, "weight_decay": cfg.weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+    return torch.optim.AdamW(groups, lr=cfg.lr, betas=cfg.betas)
 
 
 def lr_lambda(step: int, cfg: OptimConfig) -> float:
@@ -59,21 +73,45 @@ class EmaModel:
 
     def __init__(self, model: nn.Module, decay: float):
         self.decay = decay
-        raise NotImplementedError("AGENT: snapshot params into shadow buffers")
+        self.shadow = {
+            k: v.detach().clone().float() for k, v in model.state_dict().items()
+        }
 
+    @torch.no_grad()
     def update(self, model: nn.Module) -> None:
-        raise NotImplementedError("AGENT: EmaModel.update")
+        d = self.decay
+        for k, v in model.state_dict().items():
+            s = self.shadow[k]
+            if v.dtype.is_floating_point:
+                s.mul_(d).add_(v.detach().float(), alpha=1.0 - d)
+            else:
+                s.copy_(v)
 
+    @torch.no_grad()
     def copy_to(self, model: nn.Module) -> None:
-        raise NotImplementedError("AGENT: EmaModel.copy_to")
+        sd = model.state_dict()
+        model.load_state_dict(
+            {k: self.shadow[k].to(sd[k].dtype) for k in sd}, strict=True
+        )
+
+    def state_dict(self) -> dict:
+        return {"decay": self.decay, "shadow": self.shadow}
+
+    def load_state_dict(self, sd: dict) -> None:
+        self.decay = sd["decay"]
+        self.shadow = {k: v.float() for k, v in sd["shadow"].items()}
 
 
 def save_ckpt(path: str, **objects) -> None:
-    raise NotImplementedError("AGENT: save_ckpt (model/optim/ema/step/config)")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    payload = {}
+    for k, v in objects.items():
+        payload[k] = v.state_dict() if hasattr(v, "state_dict") else v
+    torch.save(payload, path)
 
 
 def load_ckpt(path: str, map_location: str = "cpu") -> dict:
-    raise NotImplementedError("AGENT: load_ckpt")
+    return torch.load(path, map_location=map_location)
 
 
 # --------------------------------------------------------------------------- #
@@ -101,12 +139,52 @@ def train_codec(codec: LatentCodec, loader: DataLoader, cfg: Config) -> None:
     raise NotImplementedError("AGENT: train_codec")
 
 
+WHITENING_FILENAME = "whitening.npz"
+
+
 @torch.no_grad()
-def freeze_and_scale(codec: CodecInterface, loader: Iterable[dict], cfg: Config) -> torch.Tensor:
-    """Freeze codec params and compute Config.latent_scale (README §7).
-    AGENT TASK: set requires_grad_(False) + eval(); call compute_latent_scale;
-    return + store the scale on cfg.latent_scale."""
-    raise NotImplementedError("AGENT: freeze_and_scale")
+def freeze_and_scale(cfg: Config, sample_size: Optional[int] = None, mode: str = "zca") -> Whitening:
+    """Fit and persist the latent **whitening** (README §8) from the precomputed
+    cache. Replaces the naive per-dim scaling: SONAR's space is anisotropic and
+    correlated, so we mean-center + decorrelate (ZCA/PCA) the latents.
+
+    Reads the target memmap in `cfg.data.latent_cache_dir`, samples valid latents,
+    fits `Whitening`, saves it next to the cache, and returns it.
+    """
+    import json
+
+    import numpy as np
+
+    cache = cfg.data.latent_cache_dir
+    with open(os.path.join(cache, "meta.json")) as f:
+        meta = json.load(f)
+    num, M, q, d = meta["num"], meta["M"], meta["q"], meta["d"]
+    m_arr = np.load(os.path.join(cache, "m.npy"))
+    target = np.memmap(
+        os.path.join(cache, "target.f32"), dtype="float32", mode="r",
+        shape=(num, M, q, d),
+    )
+
+    sample_size = sample_size or cfg.data.scale_sample_size
+    collected = []
+    total = 0
+    for i in range(num):
+        mi = int(m_arr[i])
+        if mi <= 0:
+            continue
+        collected.append(np.ascontiguousarray(target[i, :mi]).reshape(-1, d))
+        total += mi * q
+        if total >= sample_size:
+            break
+    latents = torch.from_numpy(np.concatenate(collected, axis=0)).float()
+    whitening = compute_latent_whitening(latents, mode=mode)
+    whitening.save(os.path.join(cache, WHITENING_FILENAME))
+    return whitening
+
+
+def load_whitening(cfg: Config, device="cpu") -> Whitening:
+    path = os.path.join(cfg.data.latent_cache_dir, WHITENING_FILENAME)
+    return Whitening.load(path).to(device)
 
 
 # --------------------------------------------------------------------------- #
@@ -135,13 +213,100 @@ def train_predictor(
       loss = flow_loss + count_loss
       backward; clip; step; EMA.update(predictor)
 
-    Validation gate (README §4): sample with FlowSampler (EMA weights) and decode;
-    check coherence AND diversity (multiple samples per prompt must differ — the
-    whole point of going generative).
+    Validation gate (README §4/§8): decode + metric curves are done by the eval
+    script (kept out of the train loop so SONAR need not be loaded during
+    training); here we train, EMA, log losses, and checkpoint.
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    ocfg = cfg.train.phase2
+    q = cfg.predictor.latents_per_chunk
+    M = cfg.predictor.n_tgt_chunks
 
-    AGENT TASK: full loop with AMP, EMA (cfg.train.phase2.ema_decay), logging,
-    periodic sample+decode eval, checkpointing."""
-    raise NotImplementedError("AGENT: train_predictor")
+    predictor.to(device)
+    count_head.to(device)
+    whitening = load_whitening(cfg, device)
+
+    modules = nn.ModuleList([predictor, count_head])
+    opt = make_optimizer(modules, ocfg)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_lambda(s, ocfg))
+    ema = EmaModel(predictor, ocfg.ema_decay)
+
+    dtype_map = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }
+    amp_dtype = dtype_map[ocfg.amp_dtype]
+    use_amp = device == "cuda" and amp_dtype != torch.float32
+    scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
+    cfg_drop = cfg.predictor.cfg_dropout
+    out_dir = cfg.train.out_dir
+    os.makedirs(out_dir, exist_ok=True)
+
+    predictor.train()
+    count_head.train()
+    step = 0
+    done = False
+    while not done:
+        for batch in loader:
+            context = whitening.apply(batch["context"].to(device))   # [B,N,q,d]
+            target = whitening.apply(batch["target"].to(device))     # [B,M,q,d]
+            cmask = batch["context_mask"].to(device)                 # [B,N]
+            tmask = batch["target_mask"].to(device)                  # [B,M]
+            m = batch["m"].to(device)
+            B = context.shape[0]
+            d = context.shape[-1]
+
+            C = context.reshape(B, -1, d)            # [B, N*q, d]
+            Z0 = target.reshape(B, -1, d)            # [B, M*q, d]
+            ctx_tok_mask = expand_chunk_mask(cmask, q)
+            tgt_tok_mask = expand_chunk_mask(tmask, q)
+
+            t = torch.rand(B, device=device)
+            eps = torch.randn_like(Z0)
+            z_t, v = flow_matching_target(Z0, eps, t)
+
+            ctx_in, ctxmask_in = C, ctx_tok_mask
+            if cfg_drop > 0 and torch.rand(()).item() < cfg_drop:
+                ctx_in, ctxmask_in = None, None     # CFG unconditional branch
+
+            opt.zero_grad(set_to_none=True)
+            with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+                v_hat = predictor(z_t, t, ctx_in, ctxmask_in, tgt_tok_mask)
+                w = tgt_tok_mask.float()[:, :, None]              # [B, M*q, 1]
+                flow_loss = ((v_hat - v) ** 2 * w).sum() / (w.sum().clamp(min=1.0) * d)
+                count_logits = count_head(C, ctx_tok_mask)
+                count_loss = F.cross_entropy(count_logits, m.clamp(min=0, max=M))
+                loss = flow_loss + count_loss
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(modules.parameters(), ocfg.grad_clip)
+            scaler.step(opt)
+            scaler.update()
+            sched.step()
+            ema.update(predictor)
+
+            step += 1
+            if step % 50 == 0:
+                print(
+                    f"step {step} | loss {loss.item():.4f} "
+                    f"| flow {flow_loss.item():.4f} | count {count_loss.item():.4f} "
+                    f"| lr {sched.get_last_lr()[0]:.2e}"
+                )
+            if step % ocfg.ckpt_every == 0:
+                save_ckpt(
+                    os.path.join(out_dir, f"predictor_{step}.pt"),
+                    predictor=predictor, count_head=count_head, ema=ema, step=step,
+                )
+            if step >= ocfg.max_steps:
+                done = True
+                break
+
+    save_ckpt(
+        os.path.join(out_dir, "predictor_final.pt"),
+        predictor=predictor, count_head=count_head, ema=ema, step=step,
+    )
 
 
 # --------------------------------------------------------------------------- #

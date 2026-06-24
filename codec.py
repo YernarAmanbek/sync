@@ -219,27 +219,97 @@ class LatentCodec(nn.Module):
 # Buy — frozen SONAR adapter (same interface)
 # --------------------------------------------------------------------------- #
 class SonarCodecAdapter(nn.Module):
-    """Wraps a frozen pretrained SONAR sentence encoder + decoder to expose the
-    identical CodecInterface. Skips Phase 1 entirely (README §6). Decode is
-    autoregressive (SONAR's decoder), so `steps` is ignored.
+    """Wraps a frozen pretrained SONAR sentence encoder + decoder.
 
-    AGENT TASK: load SONAR encoder/decoder via fairseq2/sonar, freeze params,
-    map our (tokens, pad_mask) <-> SONAR's expected inputs, and `latent_dim`/`q`
-    to SONAR's embedding size (q is typically 1)."""
+    This adapter is **text-native** (README §8): SONAR's official pipelines take
+    and return `list[str]` and do their own tokenization, so the hot path is
+    `encode_texts` / `decode_latents`, not the token-based `CodecInterface`. The
+    lossy tokenize->detokenize round-trip that the token interface would force is
+    deliberately avoided; `encode_chunk` / `decode_latent` raise to steer callers
+    to the text API. `q == 1`, `latent_dim == 1024`.
 
-    def __init__(self, cfg: CodecConfig, tok: TokenizerConfig):
+    `sonar`/`fairseq2` are imported lazily inside `__init__` so that importing
+    this package (or just the predictor) never drags in the native stack."""
+
+    def __init__(
+        self,
+        cfg: CodecConfig,
+        tok: TokenizerConfig,
+        device: str = "cuda",
+        lang: str = "eng_Latn",
+        dtype: Optional[torch.dtype] = None,
+    ):
         super().__init__()
         self.latent_dim = cfg.latent_dim
         self.latents_per_chunk = cfg.latents_per_chunk
-        raise NotImplementedError("AGENT: load + freeze SONAR, wire I/O")
+        self.device = device
+        self.lang = lang
+        self.dtype = dtype or torch.float32
+
+        # lazy native imports — keep them out of package import time
+        from sonar.inference_pipelines.text import (  # type: ignore
+            EmbeddingToTextModelPipeline,
+            TextToEmbeddingModelPipeline,
+        )
+
+        self._t2vec = TextToEmbeddingModelPipeline(
+            encoder=cfg.sonar_encoder,
+            tokenizer=cfg.sonar_encoder,
+            device=torch.device(device),
+        )
+        self._vec2t = EmbeddingToTextModelPipeline(
+            decoder=cfg.sonar_decoder,
+            tokenizer=cfg.sonar_encoder,
+            device=torch.device(device),
+        )
+        # frozen: SONAR is never trained here
+        for p in self.parameters():
+            p.requires_grad_(False)
+        self.eval()
+
+    # --- text-native API (use this on the SONAR path) --------------------- #
+    @torch.no_grad()
+    def encode_texts(self, texts: list[str], batch_size: int = 64) -> torch.Tensor:
+        """`list[str]` (length N) -> latent means `[N, q=1, d=1024]` (un-whitened)."""
+        emb = self._t2vec.predict(
+            texts, source_lang=self.lang, batch_size=batch_size
+        )  # [N, 1024]
+        emb = emb.to(torch.float32)
+        return emb.unsqueeze(1)  # [N, 1, 1024]
 
     @torch.no_grad()
+    def decode_latents(
+        self, z: torch.Tensor, batch_size: int = 64, max_seq_len: int = 512
+    ) -> list[str]:
+        """`[N, q=1, d]` (or `[N, d]`) un-whitened latents -> `list[str]`."""
+        if z.dim() == 3:
+            z = z.squeeze(1)  # [N, d]
+        z = z.to(self._embedding_dtype())
+        return self._vec2t.predict(
+            z, target_lang=self.lang, batch_size=batch_size, max_seq_len=max_seq_len
+        )
+
+    def _embedding_dtype(self) -> torch.dtype:
+        # match the decoder's expected input dtype if discoverable; default fp32
+        try:
+            return next(self._vec2t.model.parameters()).dtype
+        except Exception:
+            return torch.float32
+
+    # --- token interface (intentionally unsupported on the SONAR path) ---- #
+    @torch.no_grad()
     def encode_chunk(self, tokens: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("AGENT: SONAR encode -> [B, q, d]")
+        raise NotImplementedError(
+            "SonarCodecAdapter is text-native; use encode_texts(list[str]) instead "
+            "of the token-based encode_chunk."
+        )
 
     @torch.no_grad()
     def decode_latent(self, z: torch.Tensor, steps: Optional[int] = None) -> torch.Tensor:
-        raise NotImplementedError("AGENT: SONAR autoregressive decode -> [B, L]")
+        raise NotImplementedError(
+            "SonarCodecAdapter is text-native; use decode_latents(z) -> list[str] "
+            "instead of the token-based decode_latent."
+        )
 
 
 def build_codec(cfg: CodecConfig, tok: TokenizerConfig) -> CodecInterface:
