@@ -287,7 +287,7 @@ def _hf_load(path, split: str, name: Optional[str] = None):
     from datasets import load_dataset  # type: ignore
 
     paths = [path] if isinstance(path, str) else list(path)
-    last = None
+    errors: list[str] = []
     for p in paths:
         base = dict(path=p, split=split)
         if name is not None:
@@ -297,8 +297,11 @@ def _hf_load(path, split: str, name: Optional[str] = None):
             try:
                 return load_dataset(**kw)
             except Exception as e:  # TypeError (kwarg removed), DatasetNotFoundError, etc.
-                last = e
-    raise last
+                variant = ",".join(f"{k}={v!r}" for k, v in kw.items() if k != "split")
+                errors.append(f"  [{variant}] -> {type(e).__name__}: {e}")
+    raise RuntimeError(
+        "all load attempts failed for " + repr(paths) + ":\n" + "\n".join(errors)
+    )
 
 
 def load_task_pairs(
