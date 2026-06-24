@@ -21,12 +21,18 @@ def main() -> None:
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--encode-batch-size", type=int, default=256)
     ap.add_argument("--whiten-mode", default="zca", choices=["zca", "pca"])
+    ap.add_argument("--cache-dir", default=None,
+                    help="override cache dir (use a separate dir for the held-out cache)")
+    ap.add_argument("--no-whiten", action="store_true",
+                    help="skip whitening fit (held-out cache must reuse the TRAIN whitening)")
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
     if args.smoke and args.limit is None:
         args.limit = 256
 
     cfg = get_preset(args.task)
+    if args.cache_dir is not None:
+        cfg.data.latent_cache_dir = args.cache_dir
     cfg.validate()
 
     codec = SonarCodecAdapter(cfg.codec, cfg.tokenizer, device=args.device)
@@ -39,9 +45,12 @@ def main() -> None:
         encode_batch_size=args.encode_batch_size,
     )
 
-    print("fitting whitening ...")
-    w = freeze_and_scale(cfg, mode=args.whiten_mode)
-    print(f"whitening fit (d={w.mean.shape[0]}); saved to {cfg.data.latent_cache_dir}")
+    if args.no_whiten:
+        print("skipping whitening fit (--no-whiten); held-out cache reuses TRAIN whitening")
+    else:
+        print("fitting whitening ...")
+        w = freeze_and_scale(cfg, mode=args.whiten_mode)
+        print(f"whitening fit (d={w.mean.shape[0]}); saved to {cfg.data.latent_cache_dir}")
 
 
 if __name__ == "__main__":

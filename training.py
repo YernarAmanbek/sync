@@ -22,7 +22,7 @@ import os
 
 from .codec import CodecInterface, LatentCodec
 from .config import Config, OptimConfig
-from .data import Whitening, compute_latent_whitening
+from .data import Whitening, collate_pairs, compute_latent_whitening
 from .components import expand_chunk_mask
 from .predictor import (
     CountHead,
@@ -191,6 +191,93 @@ def load_whitening(cfg: Config, device="cpu") -> Whitening:
 
 
 # --------------------------------------------------------------------------- #
+# Phase 2 — in-loop evaluation helpers (cache-only; no SONAR needed)
+# --------------------------------------------------------------------------- #
+@torch.no_grad()
+def _val_flow_loss(predictor, count_head, val_loader, whitening, q, M, device,
+                   max_batches: int = 20) -> tuple[float, float]:
+    """Held-out flow/count loss on the validation cache (same masked MSE as train)."""
+    predictor.eval()
+    count_head.eval()
+    tot_f = tot_c = 0.0
+    nb = 0
+    for batch in val_loader:
+        if nb >= max_batches:
+            break
+        context = whitening.apply(batch["context"].to(device))
+        target = whitening.apply(batch["target"].to(device))
+        cmask = batch["context_mask"].to(device)
+        tmask = batch["target_mask"].to(device)
+        m = batch["m"].to(device)
+        B, d = context.shape[0], context.shape[-1]
+        C = context.reshape(B, -1, d)
+        Z0 = target.reshape(B, -1, d)
+        ctm = expand_chunk_mask(cmask, q)
+        ttm = expand_chunk_mask(tmask, q)
+        t = torch.rand(B, device=device)
+        eps = torch.randn_like(Z0)
+        z_t, v = flow_matching_target(Z0, eps, t)
+        v_hat = predictor(z_t, t, C, ctm, ttm)
+        w = ttm.float()[:, :, None]
+        fl = ((v_hat - v) ** 2 * w).sum() / (w.sum().clamp(min=1.0) * d)
+        cl = F.cross_entropy(count_head(C, ctm), m.clamp(min=0, max=M))
+        tot_f += float(fl)
+        tot_c += float(cl)
+        nb += 1
+    return tot_f / max(1, nb), tot_c / max(1, nb)
+
+
+@torch.no_grad()
+def _latent_metric_from_cache(predictor, count_head, whitening, train_ds, heldout_ds,
+                              pcfg, n: int, guidance: float, steps: int, seed: int,
+                              device) -> dict:
+    """Decoder-free latent metric (the gate_latent computation) entirely from the
+    cached latents — no SONAR. z* and identity come straight from the cache
+    (target = encode(reference); context chunk-0 = encode(prompt lede)); zhat is
+    the sampler's prediction un-whitened back to raw SONAR space.
+
+    Caller is responsible for having EMA weights live in `predictor`."""
+    q, M, d = pcfg.latents_per_chunk, pcfg.n_tgt_chunks, pcfg.latent_dim
+    sampler = FlowSampler(predictor, count_head, pcfg)
+
+    def gather(ds):
+        return collate_pairs([ds[i] for i in range(min(n, len(ds)))])
+
+    def cond(batch):
+        ctx = batch["context"].to(device)            # [B,N,q,d] raw
+        tgt = batch["target"].to(device)             # [B,M,q,d] raw
+        cmask = batch["context_mask"].to(device)
+        B, N = ctx.shape[0], ctx.shape[1]
+        ctx_w = whitening.apply(ctx).reshape(B, N * q, d)
+        ctm = expand_chunk_mask(cmask, q)
+        gen = torch.Generator(device=device).manual_seed(seed)
+        Zw, _m = sampler.sample(ctx_w, ctm, steps=steps, guidance_scale=guidance, generator=gen)
+        Zraw = whitening.invert(Zw).reshape(B, M, q, d)   # raw SONAR space
+        zhat0 = Zraw[:, 0].reshape(B, -1)
+        zstar0 = tgt[:, 0].reshape(B, -1)
+        ident0 = ctx[:, 0].reshape(B, -1)
+        c = F.cosine_similarity(zhat0, zstar0, dim=1)
+        return c, zstar0, ident0
+
+    h_cos, h_zstar, h_ident = cond(gather(heldout_ds))
+    t_cos, t_zstar, _ = cond(gather(train_ds))
+
+    identity = float(F.cosine_similarity(h_ident, h_zstar, dim=1).mean())
+    k = min(h_zstar.shape[0], t_zstar.shape[0])
+    perm = torch.randperm(
+        t_zstar.shape[0], generator=torch.Generator().manual_seed(seed)
+    )[:k].to(t_zstar.device)
+    marginal = float(F.cosine_similarity(h_zstar[:k], t_zstar[perm], dim=1).mean())
+    return {
+        "heldout_cos": float(h_cos.mean()),
+        "train_cos": float(t_cos.mean()),
+        "identity": identity,
+        "marginal": marginal,
+        "gap": float(t_cos.mean() - h_cos.mean()),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Phase 2 — predictor
 # --------------------------------------------------------------------------- #
 def train_predictor(
@@ -198,6 +285,16 @@ def train_predictor(
     count_head: CountHead,
     loader: DataLoader,
     cfg: Config,
+    *,
+    heldout_ds=None,
+    eval_n: int = 300,
+    eval_guidance: float = 1.0,
+    eval_steps: int = 50,
+    eval_seed: int = 0,
+    val_batches: int = 20,
+    decode_readiness: float = 0.85,
+    sample_eval: bool = False,
+    sample_n: int = 5,
 ) -> None:
     """Flow-matching training on cached latent pairs (codec is frozen, not used
     here — latents are precomputed).
@@ -224,10 +321,12 @@ def train_predictor(
     ocfg = cfg.train.phase2
     q = cfg.predictor.latents_per_chunk
     M = cfg.predictor.n_tgt_chunks
+    pcfg = cfg.predictor
 
     predictor.to(device)
     count_head.to(device)
     whitening = load_whitening(cfg, device)
+    train_ds = loader.dataset
 
     modules = nn.ModuleList([predictor, count_head])
     opt = make_optimizer(modules, ocfg)
@@ -245,6 +344,65 @@ def train_predictor(
     cfg_drop = cfg.predictor.cfg_dropout
     out_dir = cfg.train.out_dir
     os.makedirs(out_dir, exist_ok=True)
+
+    # held-out evaluation plumbing (cache-only metric + val loss; SONAR-free)
+    val_loader = None
+    if heldout_ds is not None:
+        val_loader = DataLoader(
+            heldout_ds, batch_size=ocfg.batch_size, shuffle=False,
+            collate_fn=collate_pairs, num_workers=0, drop_last=False,
+        )
+    sample_codec = None
+    if sample_eval and heldout_ds is not None:
+        from .codec import SonarCodecAdapter  # lazy: only when sampling is requested
+        sample_codec = SonarCodecAdapter(cfg.codec, cfg.tokenizer, device=device)
+    sample_sampler = FlowSampler(predictor, count_head, pcfg)
+    best_heldout = -1.0
+
+    def run_eval(step: int) -> None:
+        nonlocal best_heldout
+        # latent metric + sample dump use EMA weights; val loss uses live weights
+        vf, vc = _val_flow_loss(predictor, count_head, val_loader, whitening, q, M, device, val_batches)
+        backup = {k: v.detach().clone() for k, v in predictor.state_dict().items()}
+        ema.copy_to(predictor)
+        predictor.eval()
+        met = _latent_metric_from_cache(
+            predictor, count_head, whitening, train_ds, heldout_ds,
+            pcfg, eval_n, eval_guidance, eval_steps, eval_seed, device,
+        )
+        hc = met["heldout_cos"]
+        best_so_far = max(best_heldout, hc)
+        print(
+            f"[eval step {step}] val_flow {vf:.4f} | "
+            f"heldout_cos {hc:.4f} / {decode_readiness:.2f} target "
+            f"(best {best_so_far:.4f}) | "
+            f"train_cos {met['train_cos']:.4f} | gap {met['gap']:+.4f} | "
+            f"marginal {met['marginal']:.4f} | identity {met['identity']:.4f}"
+        )
+        if sample_codec is not None:
+            items = collate_pairs([heldout_ds[i] for i in range(min(sample_n, len(heldout_ds)))])
+            ctx = items["context"].to(device)
+            cmask = items["context_mask"].to(device)
+            Bs, N = ctx.shape[0], ctx.shape[1]
+            ctx_w = whitening.apply(ctx).reshape(Bs, N * q, ctx.shape[-1])
+            ctm = expand_chunk_mask(cmask, q)
+            Zw, _m = sample_sampler.sample(ctx_w, ctm, steps=eval_steps, guidance_scale=eval_guidance)
+            Zraw = whitening.invert(Zw).reshape(Bs, M, q, ctx.shape[-1])
+            texts = sample_codec.decode_latents(Zraw[:, 0])
+            print("  [lagging smell-check; sample quality trails latent cos, sharpens past ~0.85]")
+            for tx in texts:
+                print("   sample:", tx[:160])
+        if hc > best_heldout:
+            best_heldout = hc
+            save_ckpt(
+                os.path.join(out_dir, "predictor_best.pt"),
+                predictor=predictor, count_head=count_head, ema=ema, step=step,
+                heldout_cos=hc,
+            )
+            print(f"  new best heldout_cos {hc:.4f} -> predictor_best.pt")
+        predictor.load_state_dict(backup)
+        predictor.train()
+        count_head.train()
 
     predictor.train()
     count_head.train()
@@ -297,6 +455,8 @@ def train_predictor(
                     f"| flow {flow_loss.item():.4f} | count {count_loss.item():.4f} "
                     f"| lr {sched.get_last_lr()[0]:.2e}"
                 )
+            if val_loader is not None and step % ocfg.val_every == 0:
+                run_eval(step)
             if step % ocfg.ckpt_every == 0:
                 save_ckpt(
                     os.path.join(out_dir, f"predictor_{step}.pt"),
@@ -306,6 +466,8 @@ def train_predictor(
                 done = True
                 break
 
+    if val_loader is not None:
+        run_eval(step)
     save_ckpt(
         os.path.join(out_dir, "predictor_final.pt"),
         predictor=predictor, count_head=count_head, ema=ema, step=step,
