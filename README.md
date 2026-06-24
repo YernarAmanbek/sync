@@ -215,3 +215,23 @@ python -m Sync.scripts.eval_curves        --task mscoco   --ckpt runs/predictor_
 All scripts accept `--smoke` for a tiny end-to-end subset. Suggested order if
 budget-limited: Gigaword (map) → MSCOCO (diversity).
  
+
+---
+# TEMP
+ pip uninstall -y torch torchaudio torchvision fairseq2 fairseq2n sonar-space
+
+pip install torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+pip install fairseq2==0.5.2 \
+  --extra-index-url https://fair.pkg.atmeta.com/fairseq2/whl/pt2.6.0/cu124 \
+  --trusted-host fair.pkg.atmeta.com
+pip install --no-deps sonar-space
+
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"   # 2.6.0+cu124 True
+python -c "from sonar.inference_pipelines.text import TextToEmbeddingModelPipeline; print('sonar ok')"
+
+
+python -m sync.scripts.gate_ceiling       --task gigaword --smoke
+python -m sync.scripts.precompute_latents  --task gigaword --smoke
+python -m sync.scripts.gate_uncond_flow    --task gigaword --smoke
+python -m sync.scripts.train_predictor     --task gigaword --smoke
+python -m sync.scripts.eval_curves         --task gigaword --ckpt runs/predictor_final.pt --smoke

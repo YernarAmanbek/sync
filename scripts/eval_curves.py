@@ -32,6 +32,8 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=None, help="ODE steps override")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--no-ema", action="store_true")
+    ap.add_argument("--show", type=int, default=0,
+                    help="print this many (prompt, reference, samples) examples per guidance")
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
     if args.smoke:
@@ -74,6 +76,20 @@ def main() -> None:
 
     curves = guidance_curve(prompts, refs, sample_fn, args.guidance, scorer)
     print(json.dumps(curves, indent=2))
+
+    if args.show > 0:
+        n_show = min(args.show, len(prompts))
+        for g in args.guidance:
+            print("\n" + "=" * 78)
+            print(f"[examples] guidance={g}  (showing {n_show})")
+            print("=" * 78)
+            for i in range(n_show):
+                samples = sample_fn(prompts[i], g)
+                print(f"\n--- example {i} ---")
+                print("  prompt   :", prompts[i])
+                print("  ref      :", " | ".join(refs[i]) if refs[i] else "(none)")
+                for j, s in enumerate(samples):
+                    print(f"  sample {j} :", s)
 
 
 if __name__ == "__main__":
