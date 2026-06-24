@@ -65,7 +65,10 @@ def main() -> None:
     ap.add_argument("--out-dir", default="./runs")
 
     # --- gate_ceiling ---
-    ap.add_argument("--ceiling-limit", type=int, default=None)
+    # a ceiling estimate is stable on a small sample; default to a cheap cap so the
+    # full validation split (~190k for gigaword, autoregressive SONAR decode) is not
+    # accidentally processed. Pass 0 to run on the entire split.
+    ap.add_argument("--ceiling-limit", type=int, default=2000)
 
     # --- eval_curves ---
     ap.add_argument("--eval-split", default="validation")
@@ -94,7 +97,7 @@ def main() -> None:
 
     if not args.skip_ceiling:
         a = ["--task", args.task, "--split", args.eval_split, "--device", args.device, *smoke]
-        if args.ceiling_limit is not None:
+        if args.ceiling_limit and args.ceiling_limit > 0:
             a += ["--limit", str(args.ceiling_limit)]
         stages.append(("gate_ceiling", a))
 
