@@ -15,7 +15,11 @@
 # The packages below deliberately avoid torch/fairseq2/sonar-space version pins.
 
 # --- data + chunking ---
-datasets>=2.18
+# datasets>=4.0 removed script-based loading + trust_remote_code; classic
+# `gigaword` is script-based, so pin <4 (3.6.x). The loader also falls back to
+# the Hub parquet export branch, but pinning <4 is the reliable path.
+datasets>=3.5,<4
+hf_transfer>=0.1            # some HF images set HF_HUB_ENABLE_HF_TRANSFER=1 and require this
 syntok>=1.4
 sentencepiece>=0.1.99
 

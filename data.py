@@ -267,12 +267,38 @@ def collate_chunks(batch: list[dict]) -> dict:
 # `refs` is the full reference set for eval (multi-ref for MSCOCO); training
 # uses (prompt, response).
 # --------------------------------------------------------------------------- #
+def _hf_load(path: str, split: str, name: Optional[str] = None):
+    """Robust loader across `datasets` 3.x and 4.x.
+
+    `datasets>=4.0` removed script-based loading and `trust_remote_code`. We try,
+    in order: (1) plain load (works for parquet-native repos and on 3.x),
+    (2) with trust_remote_code=True (3.x script datasets like classic gigaword),
+    (3) the Hub's parquet export branch `refs/convert/parquet` (works on 4.x for
+    datasets that only had a loader script on main)."""
+    from datasets import load_dataset  # type: ignore
+
+    base = dict(path=path, split=split)
+    if name is not None:
+        base["name"] = name
+    attempts = [
+        base,
+        {**base, "trust_remote_code": True},
+        {**base, "revision": "refs/convert/parquet"},
+    ]
+    last = None
+    for kw in attempts:
+        try:
+            return load_dataset(**kw)
+        except Exception as e:  # TypeError (kwarg removed), DatasetNotFoundError, etc.
+            last = e
+    raise last
+
+
 def load_task_pairs(
     task: str, split: str = "train", limit: Optional[int] = None
 ) -> Iterator[tuple[str, str, list[str]]]:
     """Stream (prompt, response, refs) for a task. Uses HF `datasets`; falls back
-    cleanly if a particular loader script is unavailable (parquet mirrors)."""
-    from datasets import load_dataset  # type: ignore
+    cleanly across datasets 3.x/4.x (parquet export branch)."""
 
     def _take(it):
         for i, ex in enumerate(it):
@@ -281,21 +307,21 @@ def load_task_pairs(
             yield ex
 
     if task == "gigaword":
-        ds = load_dataset("gigaword", split=split, trust_remote_code=True)
+        ds = _hf_load("gigaword", split)
         for ex in _take(ds):
             doc, summary = ex["document"], ex["summary"]
             if doc and summary:
                 yield doc, summary, [summary]
 
     elif task == "xsum":
-        ds = load_dataset("EdinburghNLP/xsum", split=split)
+        ds = _hf_load("EdinburghNLP/xsum", split)
         for ex in _take(ds):
             doc, summary = ex["document"], ex["summary"]
             if doc and summary:
                 yield doc, summary, [summary]
 
     elif task == "cnn_dailymail":
-        ds = load_dataset("cnn_dailymail", "3.0.0", split=split)
+        ds = _hf_load("cnn_dailymail", split, name="3.0.0")
         for ex in _take(ds):
             doc, summary = ex["article"], ex["highlights"]
             if doc and summary:
@@ -304,7 +330,7 @@ def load_task_pairs(
     elif task == "mscoco":
         # group the 5 captions per image; prompt = one caption, target = another,
         # refs = all captions (multi-reference coverage at eval).
-        ds = load_dataset("yerevann/coco-karpathy", split=split)
+        ds = _hf_load("yerevann/coco-karpathy", split)
         for ex in _take(ds):
             caps = ex.get("sentences") or ex.get("captions") or []
             caps = [c for c in caps if c]
