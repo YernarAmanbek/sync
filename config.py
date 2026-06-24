@@ -116,7 +116,7 @@ class OptimConfig:
     batch_size: int = 256
     amp_dtype: str = "bfloat16"     # {"bfloat16", "float16", "float32"}
     ema_decay: float = 0.9999       # EMA of weights (critical for the predictor)
-    ckpt_every: int = 5_000
+    ckpt_every: int = 10_000
     val_every: int = 2_000
 
 
