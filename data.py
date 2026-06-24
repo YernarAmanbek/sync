@@ -267,30 +267,37 @@ def collate_chunks(batch: list[dict]) -> dict:
 # `refs` is the full reference set for eval (multi-ref for MSCOCO); training
 # uses (prompt, response).
 # --------------------------------------------------------------------------- #
-def _hf_load(path: str, split: str, name: Optional[str] = None):
+def _hf_load(path, split: str, name: Optional[str] = None):
     """Robust loader across `datasets` 3.x and 4.x.
 
-    `datasets>=4.0` removed script-based loading and `trust_remote_code`. We try,
-    in order: (1) plain load (works for parquet-native repos and on 3.x),
+    `path` may be a single repo id or a list of candidate ids tried in order
+    (canonical owner-prefixed id first, legacy alias last). Owner-prefixed ids
+    are required since HF moved legacy datasets under owner accounts (e.g.
+    `gigaword` -> `Harvard/gigaword`); the bare aliases now 404 intermittently.
+
+    `datasets>=4.0` removed script-based loading and `trust_remote_code`. For each
+    candidate id we try, in order: (1) plain load (parquet-native repos and 3.x),
     (2) with trust_remote_code=True (3.x script datasets like classic gigaword),
-    (3) the Hub's parquet export branch `refs/convert/parquet` (works on 4.x for
-    datasets that only had a loader script on main)."""
+    (3) the Hub's parquet export branch `refs/convert/parquet` (4.x, for datasets
+    that only had a loader script on main but were auto-converted to parquet).
+
+    NOTE: a script-only dataset with no parquet export (gigaword's case) cannot be
+    loaded on `datasets>=4.0` by any path. Use `datasets>=3.5,<4` (see
+    requirements.txt) for those tasks."""
     from datasets import load_dataset  # type: ignore
 
-    base = dict(path=path, split=split)
-    if name is not None:
-        base["name"] = name
-    attempts = [
-        base,
-        {**base, "trust_remote_code": True},
-        {**base, "revision": "refs/convert/parquet"},
-    ]
+    paths = [path] if isinstance(path, str) else list(path)
     last = None
-    for kw in attempts:
-        try:
-            return load_dataset(**kw)
-        except Exception as e:  # TypeError (kwarg removed), DatasetNotFoundError, etc.
-            last = e
+    for p in paths:
+        base = dict(path=p, split=split)
+        if name is not None:
+            base["name"] = name
+        for kw in (base, {**base, "trust_remote_code": True},
+                   {**base, "revision": "refs/convert/parquet"}):
+            try:
+                return load_dataset(**kw)
+            except Exception as e:  # TypeError (kwarg removed), DatasetNotFoundError, etc.
+                last = e
     raise last
 
 
@@ -307,21 +314,21 @@ def load_task_pairs(
             yield ex
 
     if task == "gigaword":
-        ds = _hf_load("gigaword", split)
+        ds = _hf_load(["Harvard/gigaword", "gigaword"], split)
         for ex in _take(ds):
             doc, summary = ex["document"], ex["summary"]
             if doc and summary:
                 yield doc, summary, [summary]
 
     elif task == "xsum":
-        ds = _hf_load("EdinburghNLP/xsum", split)
+        ds = _hf_load(["EdinburghNLP/xsum", "xsum"], split)
         for ex in _take(ds):
             doc, summary = ex["document"], ex["summary"]
             if doc and summary:
                 yield doc, summary, [summary]
 
     elif task == "cnn_dailymail":
-        ds = _hf_load("cnn_dailymail", split, name="3.0.0")
+        ds = _hf_load(["abisee/cnn_dailymail", "cnn_dailymail"], split, name="3.0.0")
         for ex in _take(ds):
             doc, summary = ex["article"], ex["highlights"]
             if doc and summary:
