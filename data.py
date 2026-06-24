@@ -317,9 +317,14 @@ def load_task_pairs(
             yield ex
 
     if task == "gigaword":
-        ds = _hf_load(["Harvard/gigaword", "gigaword"], split)
+        # The legacy `gigaword` / `Harvard/gigaword` repos are script-based and no
+        # longer resolve (HF returns 401 RepositoryNotFound for missing repos).
+        # Use parquet-native community mirrors instead (loadable on datasets 3.x
+        # AND 4.x, no trust_remote_code). Column is `article` or `document`.
+        ds = _hf_load(["SalmanFaroz/gigaword", "walzen/gigaword"], split)
         for ex in _take(ds):
-            doc, summary = ex["document"], ex["summary"]
+            doc = ex.get("document") or ex.get("article")
+            summary = ex.get("summary")
             if doc and summary:
                 yield doc, summary, [summary]
 
