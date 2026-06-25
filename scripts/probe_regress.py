@@ -86,9 +86,14 @@ class DirectRegressor(nn.Module):
 
 
 @torch.no_grad()
-def direct_metric(model, whitening, train_ds, heldout_ds, pcfg, n, device) -> dict:
+def direct_metric(model, whitening, train_ds, heldout_ds, pcfg, n, device,
+                  space: str = "whitened") -> dict:
     """Decoder-free held-out cosine for the regressor (deterministic; no sampler).
-    Same construction as the gate's latent metric so numbers are comparable."""
+    Same construction as the gate's latent metric so numbers are comparable.
+
+    `space="raw"` skips whitening entirely (the model lives in raw SONAR space),
+    matching the geometry ridge/k-NN are scored in — used to test whether the
+    train/eval geometry mismatch is what caps the whitened-space model."""
     q, M, d = pcfg.latents_per_chunk, pcfg.n_tgt_chunks, pcfg.latent_dim
 
     def gather(ds):
@@ -99,11 +104,11 @@ def direct_metric(model, whitening, train_ds, heldout_ds, pcfg, n, device) -> di
         tgt = batch["target"].to(device)                    # [B,M,q,d] raw
         cmask = batch["context_mask"].to(device)
         B, N = ctx.shape[0], ctx.shape[1]
-        ctx_w = whitening.apply(ctx).reshape(B, N * q, d)
+        ctx_in = (ctx if space == "raw" else whitening.apply(ctx)).reshape(B, N * q, d)
         ctm = expand_chunk_mask(cmask, q)
         ttm = torch.ones(B, M * q, dtype=torch.bool, device=device)  # predict full canvas
-        pred_w = model(ctx_w, ctm, ttm)
-        pred_raw = whitening.invert(pred_w).reshape(B, M, q, d)
+        pred = model(ctx_in, ctm, ttm)
+        pred_raw = (pred if space == "raw" else whitening.invert(pred)).reshape(B, M, q, d)
         zhat0 = pred_raw[:, 0].reshape(B, -1)
         zstar0 = tgt[:, 0].reshape(B, -1)
         ident0 = ctx[:, 0].reshape(B, -1)
@@ -134,6 +139,10 @@ def main() -> None:
     ap.add_argument("--min-lr-ratio", type=float, default=0.1)
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--loss", choices=["cos", "mse"], default="cos")
+    ap.add_argument("--space", choices=["whitened", "raw"], default="whitened",
+                    help="train+score geometry. 'raw' drops whitening to match the "
+                         "ridge/k-NN geometry (cosine is not affine-invariant, so the "
+                         "whitened-space optimum is not the raw-space optimum).")
     ap.add_argument("--val-every", type=int, default=2000)
     ap.add_argument("--eval-n", type=int, default=300)
     ap.add_argument("--out-dir", default="./runs")
@@ -171,11 +180,13 @@ def main() -> None:
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_lambda(s, ocfg))
     ema = EmaModel(model, ocfg.ema_decay)
 
-    use_amp = device == "cuda"
+    # raw space carries a large latent mean; bf16's ~3 sig-digits can swamp the
+    # directional signal, so train raw-space in fp32 to keep the geometry honest.
+    use_amp = device == "cuda" and args.space != "raw"
     os.makedirs(args.out_dir, exist_ok=True)
     print(f"PROBE 2 — direct regression: task={args.task} examples={len(ds)} "
           f"heldout={len(heldout_ds)} steps={ocfg.max_steps} bs={ocfg.batch_size} "
-          f"lr={ocfg.lr} floor={ocfg.min_lr_ratio} loss={args.loss}")
+          f"lr={ocfg.lr} floor={ocfg.min_lr_ratio} loss={args.loss} space={args.space}")
 
     best = -1.0
 
@@ -184,7 +195,8 @@ def main() -> None:
         backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
         ema.copy_to(model)
         model.eval()
-        met = direct_metric(model, whitening, ds, heldout_ds, pcfg, args.eval_n, device)
+        met = direct_metric(model, whitening, ds, heldout_ds, pcfg, args.eval_n, device,
+                            space=args.space)
         hc = met["heldout_cos"]
         print(f"[eval step {step}] heldout_cos {hc:.4f} / flow {args.baseline:.3f} "
               f"(best {max(best, hc):.4f}) | train_cos {met['train_cos']:.4f} | "
@@ -203,8 +215,12 @@ def main() -> None:
     done = False
     while not done:
         for batch in loader:
-            context = whitening.apply(batch["context"].to(device))
-            target = whitening.apply(batch["target"].to(device))
+            if args.space == "raw":
+                context = batch["context"].to(device)
+                target = batch["target"].to(device)
+            else:
+                context = whitening.apply(batch["context"].to(device))
+                target = whitening.apply(batch["target"].to(device))
             cmask = batch["context_mask"].to(device)
             tmask = batch["target_mask"].to(device)
             B = context.shape[0]
