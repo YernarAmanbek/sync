@@ -13,31 +13,39 @@ import torch
 from .codec import CodecInterface
 from .config import Config
 from .data import Chunker, Tokenizer, Whitening
-from .predictor import CountHead, FlowMatchingPredictor, FlowSampler, ood_score
+from .predictor import (
+    CountHead,
+    FlowMatchingPredictor,
+    FlowSampler,
+    HybridPredictor,
+    HybridSampler,
+    ood_score,
+)
 
 
 class TextGenerator:
     """Wire-up of the trained system for generation.
 
-    AGENT TASK (constructor): load frozen codec (build_codec + load_ckpt), load
-    predictor + count_head with EMA weights, build Chunker/Tokenizer from cfg
-    (SAME as training), load cfg.latent_scale, construct FlowSampler. Move to
-    device, eval()."""
+    Pure-flow path: pass `predictor` (FlowMatchingPredictor) -> FlowSampler.
+    Hybrid path (additive): pass `hybrid` (HybridPredictor) -> HybridSampler, and
+    `generate`/`sample_many` accept a `temperature` (s) kwarg (0=pure mean,
+    1=full residual). Exactly one of `predictor` / `hybrid` must be given; when
+    `hybrid` is None the flow behavior is unchanged."""
 
     def __init__(
         self,
         cfg: Config,
         codec,  # SonarCodecAdapter (text-native)
-        predictor: FlowMatchingPredictor,
+        predictor: Optional[FlowMatchingPredictor],
         count_head: CountHead,
         chunker: Chunker,
         tokenizer: Optional[Tokenizer] = None,
         device: str = "cuda",
         whitening: Optional[Whitening] = None,
+        hybrid: Optional[HybridPredictor] = None,
     ):
         self.cfg = cfg
         self.codec = codec
-        self.predictor = predictor.to(device).eval()
         self.count_head = count_head.to(device).eval()
         self.chunker = chunker
         self.tok = tokenizer
@@ -47,7 +55,15 @@ class TextGenerator:
                 os.path.join(cfg.data.latent_cache_dir, "whitening.npz")
             )
         self.whitening = whitening.to(device)
-        self.sampler = FlowSampler(predictor, count_head, cfg.predictor)
+        self.is_hybrid = hybrid is not None
+        if self.is_hybrid:
+            self.hybrid = hybrid.to(device).eval()
+            self.predictor = None
+            self.sampler = HybridSampler(self.hybrid, count_head, cfg.predictor)
+        else:
+            assert predictor is not None, "pass either predictor or hybrid"
+            self.predictor = predictor.to(device).eval()
+            self.sampler = FlowSampler(predictor, count_head, cfg.predictor)
 
     @torch.no_grad()
     def generate(
@@ -56,6 +72,7 @@ class TextGenerator:
         steps: Optional[int] = None,
         guidance_scale: Optional[float] = None,
         seed: Optional[int] = None,
+        temperature: Optional[float] = None,
     ) -> str:
         """Full pipeline:
           1. chunks = chunker.chunk(prompt); tokens/pad_mask = tok.encode_batch(chunks)
@@ -101,9 +118,15 @@ class TextGenerator:
         gen = None
         if seed is not None:
             gen = torch.Generator(device=self.device).manual_seed(seed)
-        Z_w, m = self.sampler.sample(
-            C_flat, ctx_tok_mask, steps=steps, guidance_scale=guidance_scale, generator=gen
-        )
+        if self.is_hybrid:
+            Z_w, m = self.sampler.sample(
+                C_flat, ctx_tok_mask, steps=steps, guidance_scale=guidance_scale,
+                generator=gen, temperature=temperature,
+            )
+        else:
+            Z_w, m = self.sampler.sample(
+                C_flat, ctx_tok_mask, steps=steps, guidance_scale=guidance_scale, generator=gen
+            )
         Z = self.whitening.invert(Z_w).reshape(pcfg.n_tgt_chunks, q, d)
         m = int(m[0].clamp(max=self.cfg.infer.max_response_chunks))
 
@@ -119,13 +142,21 @@ class TextGenerator:
         steps: Optional[int] = None,
         guidance_scale: Optional[float] = None,
         seed: Optional[int] = None,
+        temperature: Optional[float] = None,
     ) -> list[str]:
-        """K independent samples for one prompt (for diversity/coverage eval)."""
+        """K independent samples for one prompt (for diversity/coverage eval).
+
+        On the hybrid path at `temperature==0` the sampler is deterministic (pure
+        mean), so all K samples are identical by construction — the s=0 coverage
+        baseline (one effective output)."""
         outs = []
         for i in range(k):
             s = None if seed is None else seed + i
             outs.append(
-                self.generate(prompt, steps=steps, guidance_scale=guidance_scale, seed=s)
+                self.generate(
+                    prompt, steps=steps, guidance_scale=guidance_scale, seed=s,
+                    temperature=temperature,
+                )
             )
         return outs
 

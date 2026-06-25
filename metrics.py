@@ -93,6 +93,27 @@ def self_distinctness(samples: list[list[str]], scorer: SemanticScorer) -> float
     return sum(dis) / max(1, len(dis))
 
 
+def validity(
+    samples: list[list[str]], refs: list[list[str]], scorer: SemanticScorer
+) -> float:
+    """Per-sample faithfulness — the guard against fake diversity. For each of the
+    K samples, its max semantic similarity to ANY reference; averaged over all
+    samples and prompts. Coverage can rise with temperature simply by emitting
+    junk that happens to spread; validity catches that — it must stay HIGH as `s`
+    rises for the spread to count as *valid* diversity (README §8 hybrid)."""
+    vals = []
+    for samp, ref_set in zip(samples, refs):
+        uniq = [s for s in samp if s]
+        if not uniq or not ref_set:
+            continue
+        s = scorer.embed(uniq)                           # [K, h]
+        r = scorer.embed(ref_set)                        # [R, h]
+        sim = s @ r.T                                    # [K, R]
+        best_per_sample = sim.max(dim=1).values          # [K]
+        vals.append(float(best_per_sample.mean()))
+    return sum(vals) / max(1, len(vals))
+
+
 def distinct_n(samples: list[list[str]], n: int = 2) -> float:
     """Corpus distinct-n: unique n-grams / total n-grams across all samples."""
     total, uniq = 0, set()
@@ -124,6 +145,39 @@ def guidance_curve(
         curves[g] = {
             "quality": quality_semantic_similarity(first, refs, scorer),
             "coverage": coverage(samples, refs, scorer),
+            "distinctness": self_distinctness(samples, scorer),
+            "distinct2": distinct_n(samples, n=2),
+        }
+    return curves
+
+
+def temperature_curve(
+    prompts: list[str],
+    refs: list[list[str]],
+    sample_fn: Callable[[str, float], list[str]],
+    temps: list[float],
+    scorer: SemanticScorer,
+) -> dict:
+    """Sweep the hybrid sampling temperature `s` and report the coverage/validity
+    curves that decide whether the residual flow buys VALID diversity (README §8).
+
+    `sample_fn(prompt, s) -> list[str]` returns K samples for one prompt at temp s.
+    Returns {s: {coverage, validity, distinctness, distinct2, quality}}.
+
+    Read (pre-committed decision rule):
+      * coverage ↑ with s AND validity holds high -> residual buys valid diversity.
+      * coverage ↑ but validity collapses        -> incoherent spread (fake).
+      * coverage ~flat                            -> hybrid ≈ regressor + noise.
+    coverage-against-references is the primary diversity signal; raw distinctness is
+    a secondary descriptor only (it rewards incoherent variation on its own)."""
+    curves = {}
+    for s in temps:
+        samples = [sample_fn(p, s) for p in prompts]
+        first = [smp[0] if smp else "" for smp in samples]
+        curves[s] = {
+            "coverage": coverage(samples, refs, scorer),
+            "validity": validity(samples, refs, scorer),
+            "quality": quality_semantic_similarity(first, refs, scorer),
             "distinctness": self_distinctness(samples, scorer),
             "distinct2": distinct_n(samples, n=2),
         }
