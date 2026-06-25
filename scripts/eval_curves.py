@@ -58,6 +58,9 @@ def main() -> None:
     ap.add_argument("--no-ema", action="store_true")
     ap.add_argument("--show", type=int, default=0,
                     help="print this many (prompt, references, K-samples) examples")
+    ap.add_argument("--show-temp", type=float, default=1.0,
+                    help="hybrid: temperature s for the example dump (default 1.0, the "
+                         "qualitative read; falls back to the max swept temp if not present)")
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
 
@@ -175,7 +178,10 @@ def main() -> None:
     if args.show > 0:
         n_show = min(args.show, len(prompts))
         knob = "s" if model_type == "hybrid" else "guidance"
-        show_at = args.temps[-1] if model_type == "hybrid" else (sweep_vals[0])
+        if model_type == "hybrid":
+            show_at = args.show_temp if args.show_temp in args.temps else args.temps[-1]
+        else:
+            show_at = sweep_vals[0]
         print("\n" + "=" * 78)
         print(f"[examples] {knob}={show_at}  (showing {n_show})")
         print("=" * 78)

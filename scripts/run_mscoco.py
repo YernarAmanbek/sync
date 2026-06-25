@@ -76,7 +76,9 @@ def main() -> None:
     ap.add_argument("--temps", type=float, nargs="+", default=[0.0, 0.5, 1.0, 1.5])
     ap.add_argument("--eval-limit", type=int, default=200, help="held-out prompts to score")
     ap.add_argument("--show", type=int, default=10,
-                    help="(input, refs, K-samples) examples to dump at the top temp")
+                    help="(input, refs, K-samples) examples to dump")
+    ap.add_argument("--show-temp", type=float, default=1.0,
+                    help="temperature s for the example dump (default 1.0)")
 
     # skips
     ap.add_argument("--skip-train-cache", action="store_true")
@@ -130,6 +132,7 @@ def main() -> None:
             "--temps", *[str(t) for t in args.temps],
             "--guidance", str(args.eval_guidance),
             "--show", str(args.show),
+            "--show-temp", str(args.show_temp),
             "--device", args.device,
         ]
         stages.append(("eval_curves", sweep_args))
