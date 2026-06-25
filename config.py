@@ -88,6 +88,11 @@ class PredictorConfig:
     guidance_scale: float = 2.0     # classifier-free guidance weight (1.0 = off)
     ode_solver: str = "euler"       # {"euler", "midpoint", "rk4"}
 
+    # --- hybrid mean + flow-residual (additive; defaults preserve pure-flow path) ---
+    hybrid: bool = False            # False keeps the existing FlowMatchingPredictor path
+    hybrid_mean_weight: float = 1.0 # weight on the MeanHead MSE in the combined loss
+    hybrid_sample_temp: float = 1.0 # default sampling temp s (0=pure mean, 1=full residual)
+
 
 # --------------------------------------------------------------------------- #
 # Data

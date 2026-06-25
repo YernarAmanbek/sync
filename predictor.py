@@ -226,6 +226,163 @@ class FlowSampler:
 
 
 # --------------------------------------------------------------------------- #
+# Hybrid mean + flow-residual (additive; gated behind cfg.predictor.hybrid)
+# --------------------------------------------------------------------------- #
+class MeanHead(nn.Module):
+    """Deterministic conditional mean μ(x) in WHITENED space (README §8 hybrid).
+
+    Promoted from the DirectRegressor that scored 0.578 held-out in the pre-VAE
+    battery: a learned target-query bank cross-attends to the whitened context and
+    projects to μ [B, M*q, d]. No time embedding, no noise, no CFG — always
+    conditional. Same backbone width/depth as the flow predictor."""
+
+    def __init__(self, cfg: PredictorConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.q = cfg.latents_per_chunk
+        self.M = cfg.n_tgt_chunks
+        self.d = cfg.latent_dim
+        n_query = self.M * self.q
+        self.query = nn.Parameter(torch.randn(1, n_query, cfg.d_model) * 0.02)
+        self.ctx_proj = nn.Linear(cfg.latent_dim, cfg.d_model)
+        self.tgt_pos = ChunkAwarePositionalEmbedding(cfg.n_tgt_chunks, cfg.latents_per_chunk, cfg.d_model)
+        self.ctx_pos = ChunkAwarePositionalEmbedding(cfg.n_ctx_chunks, cfg.latents_per_chunk, cfg.d_model)
+        self.backbone = TransformerStack(
+            cfg.d_model, cfg.n_heads, cfg.n_layers, cfg.ffn_mult, cfg.dropout, cross_attn=True
+        )
+        self.out_proj = nn.Linear(cfg.d_model, cfg.latent_dim)
+
+    def forward(
+        self,
+        context: torch.Tensor,                        # [B, N_ctx*q, d] (whitened)
+        context_mask: Optional[torch.Tensor] = None,  # [B, N_ctx*q] bool
+        target_mask: Optional[torch.Tensor] = None,   # [B, M*q] bool
+    ) -> torch.Tensor:                                # μ [B, M*q, d] (whitened)
+        B = context.shape[0]
+        h = self.tgt_pos(self.query.expand(B, -1, -1))     # [B, M*q, d_model]
+        ctx = self.ctx_pos(self.ctx_proj(context))         # [B, N_ctx*q, d_model]
+        h = self.backbone(h, self_mask=target_mask, context=ctx, context_mask=context_mask)
+        return self.out_proj(h)                            # [B, M*q, d]
+
+
+class HybridPredictor(nn.Module):
+    """Container that the optimizer + EMA see as ONE module: a deterministic
+    `mean_head` (μ) and the unmodified `flow` (velocity over the RESIDUAL
+    r = z0 − μ(x).detach()). Sampling: ẑ = μ + s·flow_residual (see HybridSampler).
+
+    The flow is a vanilla FlowMatchingPredictor — it just receives residuals as
+    its target/state, so all of its CFG/null-context machinery is reused as-is."""
+
+    def __init__(self, cfg: PredictorConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.mean_head = MeanHead(cfg)
+        self.flow = FlowMatchingPredictor(cfg)
+
+    def mean(
+        self,
+        context: torch.Tensor,
+        context_mask: Optional[torch.Tensor] = None,
+        target_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """μ(x) [B, M*q, d] in whitened space (always conditional)."""
+        return self.mean_head(context, context_mask, target_mask)
+
+    def residual_velocity(
+        self,
+        r_t: torch.Tensor,                            # [B, M*q, d] noised residual
+        t: torch.Tensor,                              # [B]
+        context: Optional[torch.Tensor],              # [B, N_ctx*q, d] or None (CFG)
+        context_mask: Optional[torch.Tensor] = None,
+        target_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:                                # v_hat [B, M*q, d]
+        """Flow velocity over the residual. `context=None` is the CFG
+        unconditional branch (exactly as in the pure-flow path)."""
+        return self.flow(r_t, t, context, context_mask, target_mask)
+
+
+class HybridSampler:
+    """Drop-in mirror of FlowSampler.sample with a temperature `s`. Computes the
+    deterministic mean μ, and (unless s==0) integrates the residual ODE from noise
+    (t=0) to residual (t=1) with the SAME euler/midpoint/rk4 + CFG structure as
+    FlowSampler, returning ẑ = μ + s·R (whitened; caller inverts before decode).
+
+    At s==0 the flow is skipped entirely (returns μ) — the accuracy read is free."""
+
+    def __init__(self, hybrid: HybridPredictor, count_head: "CountHead", cfg: PredictorConfig):
+        self.hybrid = hybrid
+        self.count_head = count_head
+        self.cfg = cfg
+
+    @torch.no_grad()
+    def sample(
+        self,
+        context: torch.Tensor,                        # [B, N_ctx*q, d] (whitened)
+        context_mask: Optional[torch.Tensor] = None,
+        steps: Optional[int] = None,
+        guidance_scale: Optional[float] = None,
+        generator: Optional[torch.Generator] = None,
+        m_override: Optional[torch.Tensor] = None,
+        temperature: Optional[float] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (ẑ [B, M*q, d] whitened, m [B] predicted chunk counts)."""
+        cfg = self.cfg
+        q = cfg.latents_per_chunk
+        M = cfg.n_tgt_chunks
+        d = cfg.latent_dim
+        steps = steps or cfg.sample_steps
+        guidance = cfg.guidance_scale if guidance_scale is None else guidance_scale
+        s = cfg.hybrid_sample_temp if temperature is None else temperature
+        B = context.shape[0]
+        device = context.device
+
+        # 1. chunk count -> per-target-token mask (same as FlowSampler)
+        if m_override is not None:
+            m = m_override.to(device).long()
+        else:
+            m = self.count_head(context, context_mask).argmax(dim=-1)
+        m = m.clamp(min=1, max=M)
+        chunk_mask = torch.arange(M, device=device)[None, :] < m[:, None]
+        target_mask = expand_chunk_mask(chunk_mask, q)                     # [B, M*q]
+
+        # 2. deterministic mean (whitened)
+        mu = self.hybrid.mean(context, context_mask, target_mask)         # [B, M*q, d]
+        if s == 0.0:
+            return mu, m                                                  # pure mean; no flow
+
+        # 3. residual ODE from noise -> residual, CFG on the residual velocity field
+        R = torch.randn(B, M * q, d, device=device, generator=generator)
+
+        def velocity(r: torch.Tensor, t_scalar: float) -> torch.Tensor:
+            t = torch.full((B,), t_scalar, device=device)
+            v_cond = self.hybrid.residual_velocity(r, t, context, context_mask, target_mask)
+            if guidance == 1.0:
+                return v_cond
+            v_uncond = self.hybrid.residual_velocity(r, t, None, None, target_mask)
+            return v_uncond + guidance * (v_cond - v_uncond)
+
+        dt = 1.0 / steps
+        solver = cfg.ode_solver
+        for k in range(steps):
+            t0 = k * dt
+            if solver == "euler":
+                R = R + dt * velocity(R, t0)
+            elif solver == "midpoint":
+                v1 = velocity(R, t0)
+                R = R + dt * velocity(R + 0.5 * dt * v1, t0 + 0.5 * dt)
+            elif solver == "rk4":
+                k1 = velocity(R, t0)
+                k2 = velocity(R + 0.5 * dt * k1, t0 + 0.5 * dt)
+                k3 = velocity(R + 0.5 * dt * k2, t0 + 0.5 * dt)
+                k4 = velocity(R + dt * k3, t0 + dt)
+                R = R + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+            else:
+                raise ValueError(f"unknown ode_solver {solver!r}")
+
+        return mu + s * R, m
+
+
+# --------------------------------------------------------------------------- #
 # Out-of-distribution gate (README §7 — there is no built-in abstention)
 # --------------------------------------------------------------------------- #
 def ood_score(
