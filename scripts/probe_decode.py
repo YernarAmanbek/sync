@@ -36,16 +36,22 @@ from ..data import Chunker, load_task_pairs
 from ..metrics import SemanticScorer
 from ..predictor import CountHead, FlowMatchingPredictor, FlowSampler
 from ..training import EmaModel, load_ckpt, load_whitening
+from .probe_regress import DirectRegressor
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--task", default="gigaword")
     ap.add_argument("--ckpt", default="runs/predictor_best.pt")
+    ap.add_argument("--model-type", choices=["auto", "flow", "regress"], default="auto",
+                    help="auto-detect from checkpoint keys (predictor=flow, model=regress)")
+    ap.add_argument("--space", choices=["whitened", "raw"], default="whitened",
+                    help="regressor only: geometry it was TRAINED in (must match)")
     ap.add_argument("--split", default="validation")
     ap.add_argument("--limit", type=int, default=20, help="prompts to decode + dump")
-    ap.add_argument("--guidance", type=float, default=1.0, help="lowest = least off-manifold")
-    ap.add_argument("--steps", type=int, default=50)
+    ap.add_argument("--guidance", type=float, default=1.0,
+                    help="flow only: lowest = least off-manifold")
+    ap.add_argument("--steps", type=int, default=50, help="flow only: ODE steps")
     ap.add_argument("--no-repeat-ngram-size", type=int, default=3)
     ap.add_argument("--repetition-penalty", type=float, default=1.5)
     ap.add_argument("--max-seq-len", type=int, default=64)
@@ -62,22 +68,36 @@ def main() -> None:
 
     codec = SonarCodecAdapter(cfg.codec, cfg.tokenizer, device=device)
     chunker = Chunker(cfg.chunk)
-    predictor = FlowMatchingPredictor(pcfg)
-    count_head = CountHead(pcfg)
+    whitening = load_whitening(cfg, device)
 
     ck = load_ckpt(args.ckpt, map_location="cpu")
-    predictor.load_state_dict(ck["predictor"])
-    count_head.load_state_dict(ck["count_head"])
-    if not args.no_ema and "ema" in ck:
-        ema = EmaModel(predictor, ck["ema"]["decay"])
-        ema.load_state_dict(ck["ema"])
-        ema.copy_to(predictor)
-        print("loaded EMA weights into predictor")
-    predictor.to(device).eval()
-    count_head.to(device).eval()
+    model_type = args.model_type
+    if model_type == "auto":
+        model_type = "regress" if "model" in ck and "predictor" not in ck else "flow"
+    print(f"checkpoint {args.ckpt} -> model_type={model_type}")
 
-    whitening = load_whitening(cfg, device)
-    sampler = FlowSampler(predictor, count_head, pcfg)
+    if model_type == "flow":
+        predictor = FlowMatchingPredictor(pcfg)
+        count_head = CountHead(pcfg)
+        predictor.load_state_dict(ck["predictor"])
+        count_head.load_state_dict(ck["count_head"])
+        if not args.no_ema and "ema" in ck:
+            ema = EmaModel(predictor, ck["ema"]["decay"])
+            ema.load_state_dict(ck["ema"])
+            ema.copy_to(predictor)
+            print("loaded EMA weights into predictor")
+        predictor.to(device).eval()
+        count_head.to(device).eval()
+        sampler = FlowSampler(predictor, count_head, pcfg)
+    else:
+        regressor = DirectRegressor(pcfg)
+        regressor.load_state_dict(ck["model"])
+        if not args.no_ema and "ema" in ck:
+            ema = EmaModel(regressor, ck["ema"]["decay"])
+            ema.load_state_dict(ck["ema"])
+            ema.copy_to(regressor)
+            print("loaded EMA weights into regressor")
+        regressor.to(device).eval()
 
     @torch.no_grad()
     def encode_chunk0(text: str):
@@ -88,34 +108,52 @@ def main() -> None:
         return z[0].reshape(-1)                          # [q*d]
 
     @torch.no_grad()
-    def sample_chunk0(prompt: str, seed: int):
-        """raw SONAR chunk-0 latent predicted for `prompt`, or None."""
+    def _encode_context(prompt: str):
+        """prompt -> (whitened-or-raw context canvas [1,N_ctx*q,d], ctx token mask) or None."""
         chunks = chunker.chunk(prompt)[:N_ctx]
         if not chunks:
             return None
         C_un = codec.encode_texts(chunks).to(device)    # [n,q,d] raw
-        C_w = whitening.apply(C_un)
-        n = C_w.shape[0]
+        n = C_un.shape[0]
         C = torch.zeros(1, N_ctx, q, d, device=device)
-        C[0, :n] = C_w
+        C[0, :n] = C_un if (model_type == "regress" and args.space == "raw") else whitening.apply(C_un)
         ctx_mask = torch.zeros(1, N_ctx, dtype=torch.bool, device=device)
         ctx_mask[0, :n] = True
         ctm = expand_chunk_mask(ctx_mask, q)
-        gen = torch.Generator(device=device).manual_seed(seed)
-        Zw, _m = sampler.sample(
-            C.reshape(1, N_ctx * q, d), ctm, steps=args.steps,
-            guidance_scale=args.guidance, generator=gen,
-        )
-        Zraw = whitening.invert(Zw).reshape(M, q, d)    # raw SONAR space
+        return C.reshape(1, N_ctx * q, d), ctm
+
+    @torch.no_grad()
+    def predict_chunk0(prompt: str, seed: int):
+        """raw SONAR chunk-0 latent predicted for `prompt`, or None."""
+        enc = _encode_context(prompt)
+        if enc is None:
+            return None
+        C_flat, ctm = enc
+        if model_type == "flow":
+            gen = torch.Generator(device=device).manual_seed(seed)
+            Zw, _m = sampler.sample(
+                C_flat, ctm, steps=args.steps,
+                guidance_scale=args.guidance, generator=gen,
+            )
+            Zraw = whitening.invert(Zw).reshape(M, q, d)
+        else:
+            ttm = torch.ones(1, M * q, dtype=torch.bool, device=device)
+            pred = regressor(C_flat, ctm, ttm)          # [1, M*q, d]
+            pred = pred if args.space == "raw" else whitening.invert(pred)
+            Zraw = pred.reshape(M, q, d)
         return Zraw[0]                                   # [q, d]
 
-    print(f"\nsettings: guidance={args.guidance} steps={args.steps} "
-          f"no_repeat_ngram={args.no_repeat_ngram_size} rep_penalty={args.repetition_penalty}")
+    if model_type == "flow":
+        print(f"\nsettings: flow guidance={args.guidance} steps={args.steps} "
+              f"no_repeat_ngram={args.no_repeat_ngram_size} rep_penalty={args.repetition_penalty}")
+    else:
+        print(f"\nsettings: regressor (deterministic mean) space={args.space} "
+              f"no_repeat_ngram={args.no_repeat_ngram_size} rep_penalty={args.repetition_penalty}")
 
     pairs = list(load_task_pairs(args.task, split=args.split, limit=args.limit))
     prompts, refs, zhat_list, ref_lat = [], [], [], []
     for i, (prompt, response, rf) in enumerate(pairs):
-        z0 = sample_chunk0(prompt, args.seed + i)
+        z0 = predict_chunk0(prompt, args.seed + i)
         if z0 is None:
             continue
         ref_text = rf[0] if rf else response
@@ -149,8 +187,11 @@ def main() -> None:
     first_ref = [r[0] for r in refs]
     sem = scorer.cos(decoded, first_ref)
 
+    expected = 0.578 if model_type == "regress" else 0.459
+    head = ("DECODED REGRESSOR MEAN LATENTS" if model_type == "regress"
+            else "DECODED FLOW PREDICTOR LATENTS")
     print("\n" + "=" * 78)
-    print("PROBE 3 — DECODED PREDICTOR LATENTS (held-out, guidance 1.0, guarded)")
+    print(f"PROBE 3 — {head} (held-out, guarded)")
     print("=" * 78)
     for i in range(len(decoded)):
         print(f"\n--- example {i} ---")
@@ -160,10 +201,16 @@ def main() -> None:
         print(f"  latent_cos {float(lat_cos[i]):+.3f}   sem_sim {float(sem[i]):+.3f}")
 
     print("\n" + "=" * 78)
-    print(f"  mean latent cosine (vs 0.459 expected) : {float(lat_cos.mean()):.4f}  "
+    print(f"  mean latent cosine (vs {expected:.3f} expected) : {float(lat_cos.mean()):.4f}  "
           f"(n={len(decoded)})")
     print(f"  mean decoded sem-sim to reference      : {float(sem.mean()):.4f}")
     print("=" * 78)
+    if model_type == "regress":
+        print("Read (the blurry-mean check): clean, on-topic (if slightly generic) "
+              "headlines clearly better than flow's salad -> mean is a sound base for "
+              "the hybrid. Bland/hedged DESPITE higher cosine -> averaging landed in a "
+              "blurry region; the residual flow is needed for coherence, not just "
+              "diversity (weight s accordingly).")
     print("Read: coherent/on-topic -> 0.459 is weak-but-working (VAE = improvement). "
           "Token-salad even here -> 0.459 too low for usable output (need better latents).")
 
