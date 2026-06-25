@@ -279,15 +279,45 @@ class SonarCodecAdapter(nn.Module):
 
     @torch.no_grad()
     def decode_latents(
-        self, z: torch.Tensor, batch_size: int = 64, max_seq_len: int = 512
+        self,
+        z: torch.Tensor,
+        batch_size: int = 64,
+        max_seq_len: int = 512,
+        no_repeat_ngram_size: Optional[int] = None,
+        repetition_penalty: Optional[float] = None,
     ) -> list[str]:
-        """`[N, q=1, d]` (or `[N, d]`) un-whitened latents -> `list[str]`."""
+        """`[N, q=1, d]` (or `[N, d]`) un-whitened latents -> `list[str]`.
+
+        Optional decode guards (`no_repeat_ngram_size`, `repetition_penalty`) are
+        forwarded to SONAR's generator when the installed build's `predict`
+        accepts them; if it doesn't, they are dropped with a warning so decoding
+        still proceeds. Best-effort hygiene for diagnostics (Probe 3), not a hard
+        dependency — the default (both None) preserves the original behavior."""
         if z.dim() == 3:
             z = z.squeeze(1)  # [N, d]
         z = z.to(self._embedding_dtype())
-        return self._vec2t.predict(
-            z, target_lang=self.lang, batch_size=batch_size, max_seq_len=max_seq_len
-        )
+        gen_kwargs: dict = {}
+        if no_repeat_ngram_size is not None:
+            gen_kwargs["no_repeat_ngram_size"] = no_repeat_ngram_size
+        if repetition_penalty is not None:
+            gen_kwargs["repetition_penalty"] = repetition_penalty
+        try:
+            return self._vec2t.predict(
+                z, target_lang=self.lang, batch_size=batch_size,
+                max_seq_len=max_seq_len, **gen_kwargs,
+            )
+        except TypeError:
+            if not gen_kwargs:
+                raise
+            import warnings
+            warnings.warn(
+                f"SONAR predict() rejected decode guards {sorted(gen_kwargs)}; "
+                "decoding without them.",
+                RuntimeWarning,
+            )
+            return self._vec2t.predict(
+                z, target_lang=self.lang, batch_size=batch_size, max_seq_len=max_seq_len
+            )
 
     def _embedding_dtype(self) -> torch.dtype:
         # match the decoder's expected input dtype if discoverable; default fp32
